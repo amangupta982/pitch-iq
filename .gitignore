@@ -1,1 +1,9 @@
 .env
+.env
+__pycache__/
+*.py[cod]
+.DS_Store
+*.egg-info/
+.venv/
+tfenv/
+*.log
