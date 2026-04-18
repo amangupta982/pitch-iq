@@ -1,254 +1,450 @@
 """
 core/live_data.py
------------------
-Live cricket data layer.
+─────────────────
+Three-tier data fetching for PitchIQ:
+    1.  cricketdata.org free API  (primary — needs CRICDATA_KEY)
+    2.  Cricbuzz HTML scraper     (fallback — no key needed)
+    3.  Built-in mock data        (offline fallback — always works)
 
-Priority:
-  1. cricketdata.org API  (free tier — set CRICDATA_KEY in .env)
-  2. Cricbuzz scraper     (unofficial, no key needed, fallback)
-  3. Demo/mock data       (if both fail or in offline mode)
+Every public function returns a *normalised* dict so consumers never
+need to know which source was used.
+
+Caching:
+    • st.cache_data(ttl=30)   for live score endpoints
+    • st.cache_data(ttl=300)  for squad / match-info endpoints
 """
 
+from __future__ import annotations
+
 import os
+import traceback
+from datetime import datetime
+
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
-# ── Load .env automatically ────────────────────────────────────────────────────
-try:
-    from dotenv import load_dotenv
-    load_dotenv()  # reads .env file from project root automatically
-except ImportError:
-    pass  # dotenv not installed — will rely on system env vars
+# ── Load .env BEFORE any os.getenv() ─────────────────────────────────
+load_dotenv()
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-CRICDATA_KEY  = os.getenv("CRICDATA_KEY", "")
-CRICDATA_BASE = "https://api.cricapi.com/v1"
-SCRAPER_BASE  = "https://m.cricbuzz.com"
-CACHE_TTL     = 30  # seconds
+CRICDATA_KEY = os.getenv("CRICDATA_KEY", "")
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+BASE_URL = "https://api.cricapi.com/v1"
 
-from data.mock_data import MOCK_SCORECARD
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def _headers():
-    return {"User-Agent": "Mozilla/5.0 (compatible; PitchIQ/1.0)"}
+# ═══════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def get_live_matches():
-    """Return list of live/recent IPL matches. API → scraper → mock."""
-    if CRICDATA_KEY:
-        try:
-            r = requests.get(
-                f"{CRICDATA_BASE}/currentMatches",
-                params={"apikey": CRICDATA_KEY, "offset": 0},
-                timeout=5,
-            )
-            data = r.json()
-            if data.get("status") == "success":
-                parsed = _parse_cricdata_list(data["data"])
-                if parsed:
-                    return parsed
-        except Exception:
-            pass
+def _dbg(msg: str) -> None:
+    """Print a debug message to the terminal if DEBUG is enabled."""
+    if DEBUG:
+        print(f"[PitchIQ] {msg}")
 
-    try:
-        return _scrape_live_matches()
-    except Exception:
-        pass
 
-    return _mock_match_list()
+def _api_get(endpoint: str, params: dict | None = None) -> dict | None:
+    """
+    Fire a GET request to the cricketdata.org API.
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def get_scorecard(match_id: str):
-    """Return full scorecard dict for a match_id."""
-    if CRICDATA_KEY:
-        try:
-            r = requests.get(
-                f"{CRICDATA_BASE}/match_scorecard",
-                params={"apikey": CRICDATA_KEY, "id": match_id},
-                timeout=5,
-            )
-            data = r.json()
-            if data.get("status") == "success":
-                return _parse_cricdata_scorecard(data["data"])
-        except Exception:
-            pass
+    Parameters
+    ----------
+    endpoint : str    e.g. "currentMatches", "match_info"
+    params   : dict   additional query-string params
+
+    Returns
+    -------
+    dict | None   parsed JSON body, or None on failure.
+    """
+    if not CRICDATA_KEY or CRICDATA_KEY == "your_free_key_from_cricketdata_org":
+        _dbg("No valid CRICDATA_KEY — skipping API call")
+        return None
+
+    url = f"{BASE_URL}/{endpoint}"
+    qp = {"apikey": CRICDATA_KEY}
+    if params:
+        qp.update(params)
 
     try:
-        return _scrape_scorecard(match_id)
-    except Exception:
-        pass
+        resp = requests.get(url, params=qp, timeout=10)
+        _dbg(f"API {endpoint} → {resp.status_code}")
+        data = resp.json()
+        if DEBUG:
+            raw = str(data)[:500]
+            _dbg(f"Raw response: {raw}")
+        if data.get("status") == "failure":
+            _dbg(f"API failure: {data.get('reason', 'unknown')}")
+            return None
+        return data
+    except Exception as e:
+        _dbg(f"API request error: {e}")
+        if DEBUG:
+            traceback.print_exc()
+        return None
 
-    return MOCK_SCORECARD
 
-# ── cricketdata.org parsers ────────────────────────────────────────────────────
-def _parse_cricdata_list(matches: list) -> list:
-    out = []
-    for m in matches:
-        series = m.get("series", "")
-        if "IPL" not in series and "Indian Premier" not in series:
-            continue
-        out.append({
-            "id":     m.get("id", ""),
-            "label":  m.get("name", "Unknown match"),
-            "status": m.get("status", ""),
-            "source": "api",
-        })
-    return out
+def _norm_team(raw: dict, fallback_id: str = "unk") -> dict:
+    """
+    Normalize a team dict from any source into the standard shape.
 
-def _parse_cricdata_scorecard(data: dict) -> dict:
-    innings_list = data.get("scorecard", [])
-    parsed = []
-    for inn in innings_list:
-        batters = []
-        for b in inn.get("batting", []):
-            batters.append({
-                "name":      b.get("batsmanName", ""),
-                "runs":      int(b.get("r", 0)),
-                "balls":     int(b.get("b", 0)),
-                "fours":     int(b.get("4s", 0)),
-                "sixes":     int(b.get("6s", 0)),
-                "sr":        float(b.get("sr", 0)),
-                "dismissal": b.get("dismissal", "batting"),
-                "out":       b.get("dismissal", "") not in ("", "batting", "not out"),
-            })
-        bowlers = []
-        for bw in inn.get("bowling", []):
-            bowlers.append({
-                "name":    bw.get("bowlerName", ""),
-                "overs":   float(bw.get("o", 0)),
-                "maidens": int(bw.get("m", 0)),
-                "runs":    int(bw.get("r", 0)),
-                "wickets": int(bw.get("w", 0)),
-                "economy": float(bw.get("eco", 0)),
-                "wides":   int(bw.get("wd", 0)),
-                "noballs": int(bw.get("nb", 0)),
-            })
-        parsed.append({
-            "team":    inn.get("batTeamName", ""),
-            "total":   inn.get("score", "0/0"),
-            "overs":   inn.get("overs", "0.0"),
-            "batters": batters,
-            "bowlers": bowlers,
-        })
-    return {
-        "match_id": data.get("id", ""),
-        "title":    data.get("name", ""),
-        "status":   data.get("status", ""),
-        "toss":     data.get("tossWinner", "") + " won the toss",
-        "venue":    data.get("venue", ""),
-        "innings":  parsed,
-        "source":   "api",
-    }
+    Parameters
+    ----------
+    raw         : dict   raw team data from API / scraper
+    fallback_id : str    id to use if not detectable
 
-# ── Cricbuzz scraper ───────────────────────────────────────────────────────────
-def _scrape_live_matches() -> list:
-    url  = f"{SCRAPER_BASE}/cricket-match/live-scores"
-    r    = requests.get(url, headers=_headers(), timeout=8)
-    soup = BeautifulSoup(r.text, "html.parser")
-    matches = []
-    for card in soup.select("div.cb-mtch-lst"):
-        link = card.select_one("a")
-        if not link:
-            continue
-        title    = card.get_text(strip=True)
-        href     = link.get("href", "")
-        parts    = href.split("/")
-        match_id = parts[2] if len(parts) > 2 else ""
-        if "IPL" in title or "Indian Premier" in title:
-            matches.append({
-                "id":     match_id,
-                "label":  title[:60],
-                "status": "live",
+    Returns
+    -------
+    dict   { id, name, short, color }
+    """
+    from data.teams_db import find_team_by_name
+
+    name = raw.get("name", raw.get("teamName", fallback_id))
+    found = find_team_by_name(name)
+    if found:
+        return {
+            "id": found["id"],
+            "name": found["name"],
+            "short": found["short"],
+            "color": found["color"],
+        }
+    short = name[:3].upper() if name else fallback_id.upper()
+    return {"id": fallback_id, "name": name, "short": short, "color": "#666"}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CRICBUZZ SCRAPER (fallback)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _scrape_cricbuzz_live() -> list[dict]:
+    """
+    Scrape Cricbuzz homepage for live IPL match data.
+
+    Returns
+    -------
+    list[dict]   list of partially-normalised match dicts, or [].
+    """
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(
+            "https://www.cricbuzz.com/cricket-match/live-scores",
+            headers=headers,
+            timeout=10,
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        matches: list[dict] = []
+
+        match_cards = soup.select("div.cb-mtch-lst.cb-tms-itm")
+        for card in match_cards[:5]:
+            title_el = card.select_one("h3.cb-lv-scr-mtch-hdr a")
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            if "IPL" not in title and "Indian Premier League" not in title:
+                continue
+
+            status_el = card.select_one("div.cb-text-live, div.cb-text-complete")
+            status = "live" if status_el and "live" in (status_el.get("class") or [""])[0] else "completed"
+
+            teams_el = card.select("div.cb-hmscg-tm-nm")
+            team_names = [t.get_text(strip=True) for t in teams_el]
+
+            match = {
+                "id": f"cb_{hash(title) % 100000}",
+                "title": title,
+                "status": status,
                 "source": "scraper",
+                "venue": "",
+                "toss": "",
+                "team_a": _norm_team({"name": team_names[0] if team_names else "Team A"}),
+                "team_b": _norm_team({"name": team_names[1] if len(team_names) > 1 else "Team B"}),
+                "innings": [],
+                "squad_a": [],
+                "squad_b": [],
+            }
+            matches.append(match)
+
+        _dbg(f"Cricbuzz scraper found {len(matches)} IPL matches")
+        return matches
+
+    except Exception as e:
+        _dbg(f"Cricbuzz scraper error: {e}")
+        if DEBUG:
+            traceback.print_exc()
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PUBLIC API FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300)
+def fetch_live_matches() -> list[dict]:
+    """
+    Fetch current live IPL matches.
+
+    Fallback chain:  API → Cricbuzz scraper → mock schedule.
+
+    Returns
+    -------
+    list[dict]   list of normalised match summary dicts.
+    """
+    # ── Tier 1: API ──
+    data = _api_get("currentMatches")
+    if data and data.get("data"):
+        matches = []
+        for m in data["data"]:
+            name = m.get("name", "")
+            match_type = m.get("matchType", "")
+            series = m.get("series_id", "")
+            # Try to filter IPL matches
+            if "ipl" in name.lower() or "indian premier" in name.lower() or match_type == "t20":
+                match = {
+                    "id": m.get("id", ""),
+                    "title": name,
+                    "status": "live" if m.get("matchStarted") and not m.get("matchEnded") else
+                              "completed" if m.get("matchEnded") else "upcoming",
+                    "source": "api",
+                    "venue": m.get("venue", ""),
+                    "toss": "",
+                    "team_a": _norm_team({"name": m.get("teams", ["", ""])[0] if m.get("teams") else ""}),
+                    "team_b": _norm_team({"name": m.get("teams", ["", ""])[1] if m.get("teams") and len(m.get("teams", [])) > 1 else ""}),
+                    "innings": [],
+                    "squad_a": [],
+                    "squad_b": [],
+                }
+                matches.append(match)
+        if matches:
+            _dbg(f"API returned {len(matches)} IPL matches")
+            return matches
+
+    # ── Tier 2: Scraper ──
+    scraped = _scrape_cricbuzz_live()
+    if scraped:
+        return scraped
+
+    # ── Tier 3: Mock ──
+    _dbg("Using mock schedule (offline mode)")
+    from data.mock_data import get_mock_schedule
+    return get_mock_schedule()
+
+
+@st.cache_data(ttl=300)
+def fetch_match_info(match_id: str) -> dict:
+    """
+    Fetch detailed match info (toss, venue, teams).
+
+    Parameters
+    ----------
+    match_id : str
+
+    Returns
+    -------
+    dict   normalised match dict with info fields populated.
+    """
+    if match_id.startswith("demo_"):
+        from data.mock_data import get_mock_match
+        return get_mock_match()
+
+    data = _api_get("match_info", {"id": match_id})
+    if data and data.get("data"):
+        d = data["data"]
+        return {
+            "id": match_id,
+            "title": d.get("name", ""),
+            "status": "live" if d.get("matchStarted") and not d.get("matchEnded") else
+                      "completed" if d.get("matchEnded") else "upcoming",
+            "source": "api",
+            "venue": d.get("venue", ""),
+            "toss": d.get("tossWinner", "") + " " + d.get("tossChoice", ""),
+            "team_a": _norm_team({"name": d.get("teams", [""])[0] if d.get("teams") else ""}),
+            "team_b": _norm_team({"name": d.get("teams", ["", ""])[1] if d.get("teams") and len(d.get("teams", [])) > 1 else ""}),
+            "innings": [],
+            "squad_a": [],
+            "squad_b": [],
+        }
+
+    # Fallback
+    from data.mock_data import get_mock_match
+    _dbg("Match info fallback → mock")
+    return get_mock_match()
+
+
+@st.cache_data(ttl=300)
+def fetch_match_squad(match_id: str) -> dict:
+    """
+    Fetch Playing 15 squads for both teams.
+
+    Parameters
+    ----------
+    match_id : str
+
+    Returns
+    -------
+    dict   {"squad_a": [...], "squad_b": [...]}  raw player lists.
+    """
+    if match_id.startswith("demo_"):
+        from data.mock_data import get_mock_match
+        m = get_mock_match()
+        return {"squad_a": m["squad_a"], "squad_b": m["squad_b"]}
+
+    data = _api_get("match_squad", {"id": match_id})
+    if data and data.get("data"):
+        squads = data["data"]
+        squad_a_raw = []
+        squad_b_raw = []
+        for i, team_data in enumerate(squads):
+            players = team_data.get("players", [])
+            parsed = []
+            for p in players:
+                parsed.append({
+                    "name": p.get("name", "Unknown"),
+                    "role": _infer_role(p.get("role", "")),
+                    "is_playing_11": p.get("playingXI", False),
+                })
+            if i == 0:
+                squad_a_raw = parsed
+            else:
+                squad_b_raw = parsed
+        return {"squad_a": squad_a_raw, "squad_b": squad_b_raw}
+
+    # Fallback
+    from data.mock_data import get_mock_match
+    _dbg("Squad fallback → mock")
+    m = get_mock_match()
+    return {"squad_a": m["squad_a"], "squad_b": m["squad_b"]}
+
+
+@st.cache_data(ttl=30)
+def fetch_scorecard(match_id: str) -> list[dict]:
+    """
+    Fetch live scorecard (ball-by-ball).
+
+    Parameters
+    ----------
+    match_id : str
+
+    Returns
+    -------
+    list[dict]   list of innings dicts with batters, bowlers, last_6_balls.
+    """
+    if match_id.startswith("demo_"):
+        from data.mock_data import get_mock_match
+        return get_mock_match()["innings"]
+
+    data = _api_get("match_scorecard", {"id": match_id})
+    if data and data.get("data"):
+        d = data["data"]
+        innings_list = []
+        for idx, sc in enumerate(d.get("scorecard", d.get("score", []))):
+            batters = []
+            for b in sc.get("batting", []):
+                batters.append({
+                    "name": b.get("batsman", {}).get("name", b.get("name", "")),
+                    "runs": b.get("r", 0),
+                    "balls": b.get("b", 0),
+                    "dismissed": b.get("dismissal", "") != "",
+                    "dismissal": b.get("dismissal", ""),
+                })
+            bowlers = []
+            for bw in sc.get("bowling", []):
+                bowlers.append({
+                    "name": bw.get("bowler", {}).get("name", bw.get("name", "")),
+                    "overs": bw.get("o", 0.0),
+                    "runs": bw.get("r", 0),
+                    "wickets": bw.get("w", 0),
+                    "econ": bw.get("eco", 0.0),
+                })
+            inning_runs = sc.get("r", sc.get("runs", 0))
+            inning_wkts = sc.get("w", sc.get("wickets", 0))
+            inning_overs = sc.get("o", sc.get("overs", 0.0))
+
+            innings_list.append({
+                "inning_number": idx + 1,
+                "batting_team": "",
+                "bowling_team": "",
+                "runs": inning_runs,
+                "wickets": inning_wkts,
+                "overs": float(inning_overs),
+                "target": None,
+                "batters": batters,
+                "bowlers": bowlers,
+                "last_6_balls": [],
             })
-    return matches or _mock_match_list()
+        if innings_list:
+            return innings_list
 
-def _scrape_scorecard(match_id: str) -> dict:
-    url  = f"{SCRAPER_BASE}/cricket-scores/{match_id}"
-    r    = requests.get(url, headers=_headers(), timeout=8)
-    soup = BeautifulSoup(r.text, "html.parser")
+    # Fallback
+    from data.mock_data import get_mock_match
+    _dbg("Scorecard fallback → mock")
+    return get_mock_match()["innings"]
 
-    title_tag  = soup.select_one("h1.cb-nav-hdr")
-    title      = title_tag.get_text(strip=True) if title_tag else "Live Match"
-    status_tag = soup.select_one("div.cb-text-complete")
-    status     = status_tag.get_text(strip=True) if status_tag else "In Progress"
 
-    innings = []
-    for inn_div in soup.select("div.cb-ltst-wgt-hdr"):
-        inn_title = inn_div.get_text(strip=True)
-        batters, bowlers = [], []
+@st.cache_data(ttl=300)
+def fetch_schedule() -> list[dict]:
+    """
+    Fetch today's IPL schedule.
 
-        bat_table = inn_div.find_next("table", class_="cb-bat-lst")
-        if bat_table:
-            for row in bat_table.select("tr")[1:]:
-                cols = [c.get_text(strip=True) for c in row.select("td")]
-                if len(cols) >= 8:
-                    batters.append({
-                        "name":      cols[0],
-                        "dismissal": cols[1],
-                        "runs":      _int(cols[2]),
-                        "balls":     _int(cols[3]),
-                        "fours":     _int(cols[5]),
-                        "sixes":     _int(cols[6]),
-                        "sr":        _float(cols[7]),
-                        "out":       cols[1] not in ("batting", "not out", ""),
-                    })
+    Returns
+    -------
+    list[dict]   match summaries.
+    """
+    data = _api_get("matches", {"offset": 0})
+    if data and data.get("data"):
+        matches = []
+        for m in data["data"]:
+            name = m.get("name", "")
+            if "ipl" in name.lower() or "indian premier" in name.lower():
+                matches.append({
+                    "id": m.get("id", ""),
+                    "title": name,
+                    "status": "live" if m.get("matchStarted") and not m.get("matchEnded") else
+                              "completed" if m.get("matchEnded") else "upcoming",
+                    "source": "api",
+                    "team_a": _norm_team({"name": m.get("teams", [""])[0] if m.get("teams") else ""}),
+                    "team_b": _norm_team({"name": m.get("teams", ["", ""])[1] if m.get("teams") and len(m.get("teams", [])) > 1 else ""}),
+                })
+                matches.append(matches[-1])  # fixed: just append once
+        # deduplicate
+        seen = set()
+        unique = []
+        for mx in matches:
+            if mx["id"] not in seen:
+                seen.add(mx["id"])
+                unique.append(mx)
+        if unique:
+            return unique
 
-        bwl_table = inn_div.find_next("table", class_="cb-bowl-lst")
-        if bwl_table:
-            for row in bwl_table.select("tr")[1:]:
-                cols = [c.get_text(strip=True) for c in row.select("td")]
-                if len(cols) >= 7:
-                    bowlers.append({
-                        "name":    cols[0],
-                        "overs":   _float(cols[1]),
-                        "maidens": _int(cols[2]),
-                        "runs":    _int(cols[3]),
-                        "wickets": _int(cols[4]),
-                        "economy": _float(cols[5]),
-                        "wides":   _int(cols[6]) if len(cols) > 6 else 0,
-                        "noballs": _int(cols[7]) if len(cols) > 7 else 0,
-                    })
+    from data.mock_data import get_mock_schedule
+    return get_mock_schedule()
 
-        score_tag = inn_div.find_next("div", class_="cb-scr-wll-chvrn")
-        score_txt = score_tag.get_text(strip=True) if score_tag else "0/0 (0)"
 
-        innings.append({
-            "team":    inn_title,
-            "total":   score_txt,
-            "overs":   _extract_overs(score_txt),
-            "batters": batters,
-            "bowlers": bowlers,
-        })
+# ═══════════════════════════════════════════════════════════════════════
+# HELPERS (private)
+# ═══════════════════════════════════════════════════════════════════════
 
-    return {
-        "match_id": match_id,
-        "title":    title,
-        "status":   status,
-        "toss":     "",
-        "venue":    "",
-        "innings":  innings or MOCK_SCORECARD["innings"],
-        "source":   "scraper",
-    }
+def _infer_role(raw_role: str) -> str:
+    """
+    Map API role strings to our canonical set.
 
-# ── Utilities ──────────────────────────────────────────────────────────────────
-def _int(v):
-    try:    return int(str(v).replace("*", ""))
-    except: return 0
+    Parameters
+    ----------
+    raw_role : str   e.g. "Batting Allrounder", "WK-Batsman"
 
-def _float(v):
-    try:    return float(str(v).replace("*", ""))
-    except: return 0.0
-
-def _extract_overs(score_txt: str) -> str:
-    import re
-    m = re.search(r"\(([0-9.]+)\)", score_txt)
-    return m.group(1) if m else "0.0"
-
-def _mock_match_list():
-    return [
-        {"id": "demo_rcb_csk", "label": "RCB vs CSK — Demo",  "status": "In Progress", "source": "mock"},
-        {"id": "demo_mi_kkr",  "label": "MI vs KKR — Demo",   "status": "Upcoming",    "source": "mock"},
-        {"id": "demo_srh_lsg", "label": "SRH vs LSG — Demo",  "status": "Upcoming",    "source": "mock"},
-    ]
+    Returns
+    -------
+    str   one of "bat", "bowl", "allrounder", "wk-bat"
+    """
+    r = raw_role.lower()
+    if "wk" in r or "keeper" in r:
+        return "wk-bat"
+    if "allrounder" in r or "all-rounder" in r:
+        return "allrounder"
+    if "bowl" in r:
+        return "bowl"
+    return "bat"
