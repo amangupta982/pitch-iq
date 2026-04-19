@@ -1,53 +1,204 @@
-"""pages/impact_sub.py — Impact substitution advisor."""
+"""
+pages/impact_sub.py
+───────────────────
+Impact Substitution recommender.
+
+Bench = Playing 15 MINUS Playing 11 (auto-detected).
+Shows exactly who is on the bench (usually 4 players) and recommends
+the best one to bring in, with timing.
+
+Displays:
+    • Bench player roster
+    • Top recommendation card (green, large)
+    • Alternatives (2nd and 3rd best)
+    • Impact score bar chart
+"""
+
+from __future__ import annotations
+
+import plotly.graph_objects as go
 import streamlit as st
-from core.engine import MatchState, impact_sub_recommendation
-from data.teams_db import TEAMS, VENUES
 
-def render():
-    st.markdown("## 🔄 Impact Sub Advisor")
-    st.markdown("*IPL 2026 Impact Player rule — who to bring in and when.*")
+from core.engine import impact_sub_recommendation
+from core.state import get_bench_players
+from components.cards import bench_player_card, analysis_card
 
-    teams_list  = list(TEAMS.keys())
-    team_labels = {k: f"{v['short']} — {v['name']}" for k, v in TEAMS.items()}
 
-    c1,c2,c3,c4,c5 = st.columns(5)
-    team_id = c1.selectbox("Your team", teams_list, format_func=lambda k: team_labels[k])
-    opp_id  = c2.selectbox("Opposition", teams_list, format_func=lambda k: team_labels[k], index=1)
-    runs    = c3.number_input("Runs", 0, 300, 86, step=1)
-    wickets = c4.number_input("Wickets", 0, 10, 3, step=1)
-    overs   = c5.number_input("Overs", 0.0, 20.0, 10.0, step=0.1, format="%.1f")
-    target  = st.number_input("Target (0 if first innings)", 0, 350, 167, step=1)
-    venue   = st.selectbox("Venue", list(VENUES.keys()))
+def render() -> None:
+    """Render the Impact Sub page."""
+    ms = st.session_state.get("match_state")
+    if not ms:
+        st.info("🔀 Select a match from the sidebar to begin.")
+        return
 
-    ms = MatchState(batting_id=team_id, bowling_id=opp_id,
-                    runs=runs, wickets=wickets, overs=overs,
-                    target=target, venue_name=venue)
+    st.markdown(
+        f'<h2 style="margin-bottom:0.1rem;">🔀 Impact Substitution</h2>'
+        f'<p style="color:#6b7280;font-size:0.85rem;margin-top:0;">'
+        f'Bench options for {ms.batting_team.get("short", "")} · '
+        f'{ms.runs}/{ms.wickets} · Over {ms.overs} · {ms.phase.upper()}</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
 
-    team  = TEAMS[team_id]
-    squad = team.get("squad", [])
+    # ── Get bench players ────────────────────────────────────────────
+    bench_batting = get_bench_players("batting")
+    bench_bowling = get_bench_players("bowling")
 
-    # Who's been used already
-    st.markdown('<div class="section-hdr">Players already used (playing XI)</div>', unsafe_allow_html=True)
-    all_players = [b["name"] for b in team["batters"]] + [b["name"] for b in team["bowlers"]]
-    used = st.multiselect("Mark as used", all_players, default=all_players[:6])
+    # Show context
+    col_bat, col_bowl = st.columns(2)
+    with col_bat:
+        st.markdown(
+            f'<div class="pitchiq-card">'
+            f'<div style="font-size:0.75rem;color:#6b7280;text-transform:uppercase;'
+            f'letter-spacing:1px;">Batting Team Bench</div>'
+            f'<div style="font-size:1.8rem;font-weight:800;color:#f0f4ff;">'
+            f'{len(bench_batting)} players</div>'
+            f'<div style="color:#9ca3af;font-size:0.8rem;">'
+            f'{ms.batting_team.get("name", "")}</div></div>',
+            unsafe_allow_html=True,
+        )
+    with col_bowl:
+        st.markdown(
+            f'<div class="pitchiq-card">'
+            f'<div style="font-size:0.75rem;color:#6b7280;text-transform:uppercase;'
+            f'letter-spacing:1px;">Bowling Team Bench</div>'
+            f'<div style="font-size:1.8rem;font-weight:800;color:#f0f4ff;">'
+            f'{len(bench_bowling)} players</div>'
+            f'<div style="color:#9ca3af;font-size:0.8rem;">'
+            f'{ms.bowling_team.get("name", "")}</div></div>',
+            unsafe_allow_html=True,
+        )
 
-    rec = impact_sub_recommendation(ms, squad, used)
+    st.markdown("---")
 
-    st.markdown('<div class="section-hdr">Impact sub recommendation</div>', unsafe_allow_html=True)
-    if rec["player"]:
-        p = rec["player"]
-        st.markdown(f"""
-        <div class="card card-green">
-          <span class="badge badge-ok">Recommended sub</span>
-          <div style="font-size:18px;font-weight:700;color:#f0f4ff;margin-bottom:6px;">{p['name']}</div>
-          <div style="font-size:12px;color:#8b95a8;margin-bottom:6px;">Role: {p.get('role','').title()} &nbsp;|&nbsp; Form: {p.get('form',0)}/100</div>
-          <div style="font-size:13px;color:#c8d0e0;margin-bottom:8px;">{rec['reason']}</div>
-          <div style="font-size:12px;color:#f59e0b;font-weight:500;">⏱ Timing: {rec['timing']}</div>
-        </div>""", unsafe_allow_html=True)
+    # ── Batting team bench analysis ──────────────────────────────────
+    st.markdown(f"### 🏏 {ms.batting_team.get('short', 'Batting')} — Bench Analysis")
 
-        if rec.get("alternatives"):
-            st.markdown("**Alternative options:**")
-            for alt in rec["alternatives"]:
-                st.markdown(f'<div class="card"><span style="color:#c8d0e0;font-weight:500">{alt["name"]}</span> — {alt.get("role","").title()}, Form {alt.get("form",0)}/100</div>', unsafe_allow_html=True)
+    if not bench_batting:
+        st.info("No bench players detected for batting team.")
     else:
-        st.info("No squad players available for substitution.")
+        recs_bat = impact_sub_recommendation(ms, bench_batting)
+        _render_bench_section(recs_bat, "batting")
+
+    st.markdown("---")
+
+    # ── Bowling team bench analysis ──────────────────────────────────
+    st.markdown(f"### 🎯 {ms.bowling_team.get('short', 'Bowling')} — Bench Analysis")
+
+    if not bench_bowling:
+        st.info("No bench players detected for bowling team.")
+    else:
+        recs_bowl = impact_sub_recommendation(ms, bench_bowling)
+        _render_bench_section(recs_bowl, "bowling")
+
+
+def _render_bench_section(recs: list[dict], team_type: str) -> None:
+    """
+    Render bench player recommendation section.
+
+    Parameters
+    ----------
+    recs      : list[dict]   ranked bench recommendations
+    team_type : str          "batting" or "bowling"
+    """
+    ms = st.session_state.get("match_state")
+
+    if not recs:
+        st.info("No recommendations available.")
+        return
+
+    # ── Situation Summary ────────────────────────────────────────────
+    if ms:
+        if ms.is_chasing and ms.rrr and ms.rrr > 10:
+            st.markdown(
+                analysis_card(
+                    f"High required rate ({ms.rrr:.1f}) — prioritize aggressive batting options. "
+                    f"An Impact Sub batter could accelerate the chase immediately."
+                ),
+                unsafe_allow_html=True,
+            )
+        elif ms.wickets >= 5:
+            st.markdown(
+                analysis_card(
+                    f"With {ms.wickets} wickets down, batting reinforcement is critical. "
+                    f"Consider bringing in a reliable middle-order option."
+                ),
+                unsafe_allow_html=True,
+            )
+        elif ms.phase == "death" and not ms.is_chasing:
+            st.markdown(
+                analysis_card(
+                    "Death overs approaching while defending — a death-bowling specialist "
+                    "from the bench could be decisive."
+                ),
+                unsafe_allow_html=True,
+            )
+
+    # ── Top Pick ─────────────────────────────────────────────────────
+    top = recs[0]
+    st.markdown(
+        bench_player_card(
+            player={"name": top["name"], "role": top["role"], "profile": top["profile"]},
+            score=top["score"],
+            reason=top["reason"],
+            timing=top["timing"],
+            is_top=True,
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # ── Alternatives ─────────────────────────────────────────────────
+    if len(recs) > 1:
+        st.markdown("#### Alternatives")
+        alt_cols = st.columns(min(3, len(recs) - 1))
+        for i, rec in enumerate(recs[1:4]):
+            with alt_cols[i % len(alt_cols)]:
+                st.markdown(
+                    bench_player_card(
+                        player={"name": rec["name"], "role": rec["role"], "profile": rec["profile"]},
+                        score=rec["score"],
+                        reason=rec["reason"],
+                        timing=rec["timing"],
+                        is_top=False,
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+    # ── Impact Score Chart ───────────────────────────────────────────
+    st.markdown("#### 📊 Impact Scores")
+    _render_impact_chart(recs)
+
+
+def _render_impact_chart(recs: list[dict]) -> None:
+    """
+    Render a bar chart of impact scores for all bench players.
+
+    Parameters
+    ----------
+    recs : list[dict]
+    """
+    names = [r["name"].split()[-1] for r in recs]
+    scores = [r["score"] for r in recs]
+    colors = ["#22c55e" if i == 0 else "#3b82f6" for i in range(len(recs))]
+
+    fig = go.Figure(go.Bar(
+        x=names,
+        y=scores,
+        marker=dict(color=colors, line=dict(width=0)),
+        text=[f"{s:.0f}" for s in scores],
+        textposition="auto",
+        textfont=dict(color="#fff", size=13, family="Inter"),
+    ))
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#111827",
+        font=dict(color="#9ca3af", family="Inter"),
+        height=250,
+        margin=dict(l=40, r=20, t=10, b=40),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(gridcolor="#1f2937", title="Impact Score"),
+        showlegend=False,
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
