@@ -1,84 +1,213 @@
-"""pages/batting_order.py — Who bats next, with situational justification."""
-import streamlit as st
+"""
+pages/batting_order.py
+──────────────────────
+Who should bat next — ranked recommendation list.
+
+Available batters = Playing 11 MINUS dismissed (auto from scorecard).
+No manual checkboxes needed.
+
+Displays:
+    • "SEND IN NOW" hero card for top pick
+    • Ranked list with player cards + rationale
+    • Form + SR comparison bar chart (Plotly)
+    • Tail-ender warning if applicable
+"""
+
+from __future__ import annotations
+
 import plotly.graph_objects as go
-from core.engine import MatchState, batting_order_recommendation
-from data.teams_db import TEAMS, VENUES
+import streamlit as st
 
-def render():
-    st.markdown("## 🏏 Batting Order Advisor")
-    st.markdown("*Who should come in next — ranked by the current match situation.*")
-    st.markdown('<div class="section-hdr">Setup</div>', unsafe_allow_html=True)
+from core.engine import batting_order_recommendation
+from core.state import get_batting_team_players
+from components.cards import send_now_card, player_card, analysis_card
 
-    teams_list  = list(TEAMS.keys())
-    team_labels = {k: f"{v['short']} — {v['name']}" for k, v in TEAMS.items()}
 
-    c1,c2,c3,c4,c5 = st.columns(5)
-    batting_id = c1.selectbox("Batting team", teams_list, format_func=lambda k: team_labels[k])
-    runs       = c2.number_input("Runs",    0, 300, 86,  step=1)
-    wickets    = c3.number_input("Wickets", 0, 10,  3,   step=1)
-    overs      = c4.number_input("Overs",   0.0, 20.0, 11.0, step=0.1, format="%.1f")
-    target     = c5.number_input("Target",  0, 350, 167, step=1)
-    venue      = st.selectbox("Venue", list(VENUES.keys()))
+def render() -> None:
+    """Render the Batting Order page."""
+    ms = st.session_state.get("match_state")
+    if not ms:
+        st.info("🏏 Select a match from the sidebar to begin.")
+        return
 
-    ms = MatchState(batting_id=batting_id, bowling_id=batting_id,
-                    runs=runs, wickets=wickets, overs=overs,
-                    target=target, venue_name=venue)
-
-    team     = TEAMS[batting_id]
-    batters  = team["batters"]
-
-    # Let coach mark who's already out
-    st.markdown('<div class="section-hdr">Mark dismissed batters</div>', unsafe_allow_html=True)
-    dismissed = []
-    cols = st.columns(len(batters))
-    for i, b in enumerate(batters):
-        if cols[i].checkbox(b["name"], key=f"out_{b['name']}"):
-            dismissed.append(b["name"])
-
-    available = [b for b in batters if b["name"] not in dismissed]
-    ranked    = batting_order_recommendation(ms, available)
-
-    st.markdown('<div class="section-hdr">Recommended batting order</div>', unsafe_allow_html=True)
-
-    for rank, b in enumerate(ranked, 1):
-        score_pct = min(100, round(b["situation_score"] / 2))
-        color = "#4caf7d" if rank == 1 else "#f59e0b" if rank == 2 else "#8b95a8"
-        badge = "Send now" if rank == 1 else f"#{rank}"
-        badge_cls = "badge-ok" if rank == 1 else "badge-warn" if rank == 2 else "badge-info"
-        st.markdown(f"""
-        <div class="card {'card-green' if rank==1 else 'card-amber' if rank==2 else ''}">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-            <div>
-              <span class="badge {badge_cls}">{badge}</span>
-              <span style="font-size:15px;font-weight:600;color:#f0f4ff;margin-left:8px;">{b['name']}</span>
-            </div>
-            <span style="font-size:12px;color:#8b95a8;">Situation score: {b['situation_score']}</span>
-          </div>
-          <div style="font-size:12px;color:#8b95a8;margin-bottom:8px;">
-            Avg {b['avg']} &nbsp;|&nbsp; SR {b['sr']} &nbsp;|&nbsp; Death SR {b.get('death_sr', b['sr'])} &nbsp;|&nbsp; Form {b['form']}/100
-          </div>
-          <div style="font-size:13px;color:#c8d0e0;font-style:italic;">{b['rationale']}</div>
-        </div>""", unsafe_allow_html=True)
-
-    # Form chart
-    st.markdown('<div class="section-hdr">Player form comparison</div>', unsafe_allow_html=True)
-    names  = [b["name"] for b in ranked]
-    form   = [b["form"] for b in ranked]
-    sr_val = [b["sr"] for b in ranked]
-    colors = ["#4caf7d" if f >= 80 else "#f59e0b" if f >= 65 else "#6b7280" for f in form]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="Form", x=names, y=form, marker_color=colors, opacity=0.9))
-    fig.add_trace(go.Scatter(name="SR", x=names, y=sr_val, mode="lines+markers",
-                             line=dict(color="#60a5fa",width=2), yaxis="y2"))
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#111827",
-        font=dict(color="#9ca3af",family="Inter"), height=260,
-        margin=dict(l=10,r=60,t=10,b=10),
-        yaxis=dict(title="Form",gridcolor="#1e2535",range=[0,110]),
-        yaxis2=dict(title="Strike Rate",overlaying="y",side="right",gridcolor="#1e2535"),
-        legend=dict(font=dict(size=11),bgcolor="rgba(0,0,0,0)"),
-        xaxis=dict(tickfont=dict(size=11)),
-        barmode="group",
+    st.markdown(
+        f'<h2 style="margin-bottom:0.1rem;">🏏 Batting Order</h2>'
+        f'<p style="color:#6b7280;font-size:0.85rem;margin-top:0;">'
+        f'{ms.batting_team.get("short", "")} · {ms.runs}/{ms.wickets} after {ms.overs} overs'
+        f' · {ms.phase.upper()} phase</p>',
+        unsafe_allow_html=True,
     )
+    st.markdown("---")
+
+    # ── Get available batters (not dismissed, not currently at crease batting) ─
+    batting_players = get_batting_team_players()
+    scorecard = st.session_state.get("scorecard", [])
+    latest = scorecard[-1] if scorecard else {}
+
+    # Find who is dismissed
+    dismissed_names = set()
+    at_crease_names = set()
+    for b in latest.get("batters", []):
+        if b.get("dismissed", False):
+            dismissed_names.add(b["name"].lower())
+        else:
+            at_crease_names.add(b["name"].lower())
+
+    # Available = Playing 11 batters who are NOT dismissed and NOT at crease
+    available = []
+    for p in batting_players:
+        name_low = p["name"].lower()
+        if name_low not in dismissed_names and name_low not in at_crease_names:
+            available.append(p)
+
+    if not available:
+        st.warning("⚠️ No available batters remaining. All players have batted or are at the crease.")
+        return
+
+    # ── Get recommendations ──────────────────────────────────────────
+    recommendations = batting_order_recommendation(ms, available)
+
+    if not recommendations:
+        st.info("No recommendations available.")
+        return
+
+    # ── Tail-ender warning ───────────────────────────────────────────
+    if ms.wickets >= 7:
+        st.markdown(
+            analysis_card(
+                "⚠️ <strong>Tail exposed!</strong> With "
+                f"{10 - ms.wickets} wickets in hand, prioritize partnerships over strike rate. "
+                "Send in someone who can rotate strike and protect the tail."
+            ),
+            unsafe_allow_html=True,
+        )
+
+    # ── Top pick: SEND IN NOW ────────────────────────────────────────
+    top = recommendations[0]
+    st.markdown(
+        send_now_card(
+            {"name": top["name"], "role": top["role"], "profile": top["profile"]},
+            top["rationale"],
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # ── Charts ───────────────────────────────────────────────────────
+    st.markdown("### 📊 Comparison")
+    col_chart1, col_chart2 = st.columns(2)
+
+    with col_chart1:
+        _render_form_chart(recommendations[:6])
+
+    with col_chart2:
+        _render_sr_chart(recommendations[:6], ms.phase)
+
+    # ── Ranked list ──────────────────────────────────────────────────
+    st.markdown("### 📋 Full Rankings")
+    for i, rec in enumerate(recommendations):
+        rank = i + 1
+        highlight = (i == 0)
+        st.markdown(
+            player_card(
+                {"name": rec["name"], "role": rec["role"], "profile": rec["profile"]},
+                rank=rank,
+                highlight=highlight,
+            ),
+            unsafe_allow_html=True,
+        )
+        # Show rationale
+        st.markdown(
+            f'<div style="color:#6b7280;font-size:0.8rem;margin:-0.5rem 0 0.8rem 2.5rem;">'
+            f'💬 {rec["rationale"]} · Score: <strong>{rec["score"]}</strong></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _render_form_chart(recs: list[dict]) -> None:
+    """
+    Render a horizontal bar chart of player form scores.
+
+    Parameters
+    ----------
+    recs : list[dict]   top recommendations
+    """
+    names = [r["name"].split()[-1] for r in recs]  # last name for brevity
+    forms = [r["profile"].get("form", 0) for r in recs]
+    colors = ["#22c55e" if f > 75 else "#f59e0b" if f > 50 else "#ef4444" for f in forms]
+
+    fig = go.Figure(go.Bar(
+        x=forms,
+        y=names,
+        orientation="h",
+        marker=dict(color=colors, line=dict(width=0)),
+        text=[f"{f}" for f in forms],
+        textposition="auto",
+        textfont=dict(color="#fff", size=12),
+    ))
+
+    fig.update_layout(
+        title=dict(text="Current Form", font=dict(size=14, color="#d1d5db")),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#111827",
+        font=dict(color="#9ca3af", family="Inter"),
+        height=250,
+        margin=dict(l=80, r=20, t=40, b=20),
+        xaxis=dict(range=[0, 100], gridcolor="#1f2937", title=""),
+        yaxis=dict(autorange="reversed", gridcolor="#1f2937"),
+        showlegend=False,
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_sr_chart(recs: list[dict], phase: str) -> None:
+    """
+    Render a bar chart comparing relevant SR for the current phase.
+
+    Parameters
+    ----------
+    recs  : list[dict]
+    phase : str   "powerplay" | "middle" | "death"
+    """
+    sr_key = {
+        "powerplay": "powerplay_sr",
+        "middle": "sr",
+        "death": "death_sr",
+    }.get(phase, "sr")
+
+    sr_label = {
+        "powerplay": "Powerplay SR",
+        "middle": "Overall SR",
+        "death": "Death SR",
+    }.get(phase, "SR")
+
+    names = [r["name"].split()[-1] for r in recs]
+    srs = [r["profile"].get(sr_key, 130) for r in recs]
+
+    fig = go.Figure(go.Bar(
+        x=srs,
+        y=names,
+        orientation="h",
+        marker=dict(
+            color=srs,
+            colorscale=[[0, "#3b82f6"], [0.5, "#8b5cf6"], [1, "#ef4444"]],
+            line=dict(width=0),
+        ),
+        text=[f"{s}" for s in srs],
+        textposition="auto",
+        textfont=dict(color="#fff", size=12),
+    ))
+
+    fig.update_layout(
+        title=dict(text=sr_label, font=dict(size=14, color="#d1d5db")),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#111827",
+        font=dict(color="#9ca3af", family="Inter"),
+        height=250,
+        margin=dict(l=80, r=20, t=40, b=20),
+        xaxis=dict(gridcolor="#1f2937", title=""),
+        yaxis=dict(autorange="reversed", gridcolor="#1f2937"),
+        showlegend=False,
+    )
+
     st.plotly_chart(fig, use_container_width=True)
