@@ -185,19 +185,37 @@ def find_team_by_name(name: str) -> dict | None:
     """
     Fuzzy-find a team by its full or short name.
 
+    Uses resolve_team_id() from squad_resolver for robust matching
+    across all 10 IPL teams including abbreviations and variations.
+
     Parameters
     ----------
-    name : str   e.g. "Chennai Super Kings", "CSK", "csk"
+    name : str   e.g. "Chennai Super Kings", "CSK", "csk",
+                       "Kolkata Knight Rid..."
 
     Returns
     -------
     dict | None   team dict if found, else None.
     """
+    if not name or not name.strip():
+        return None
+
+    # Quick exact match first (avoid circular import overhead)
     low = name.strip().lower()
     for tid, t in TEAMS.items():
         if low in (tid, t["short"].lower(), t["name"].lower()):
             return t
-    # partial match
+
+    # Use the robust resolver for fuzzy/substring/alias matching
+    try:
+        from core.squad_resolver import resolve_team_id
+        team_id = resolve_team_id(name)
+        if team_id != "unk":
+            return TEAMS.get(team_id)
+    except ImportError:
+        pass  # Fallback if circular import occurs during init
+
+    # Last resort: partial match
     for tid, t in TEAMS.items():
         if low in t["name"].lower():
             return t
