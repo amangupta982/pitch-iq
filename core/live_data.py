@@ -87,6 +87,8 @@ def _norm_team(raw: dict, fallback_id: str = "unk") -> dict:
     """
     Normalize a team dict from any source into the standard shape.
 
+    Uses resolve_team_id() for robust matching against all 10 IPL teams.
+
     Parameters
     ----------
     raw         : dict   raw team data from API / scraper
@@ -96,17 +98,24 @@ def _norm_team(raw: dict, fallback_id: str = "unk") -> dict:
     -------
     dict   { id, name, short, color }
     """
-    from data.teams_db import find_team_by_name
+    from core.squad_resolver import resolve_team_id
+    from data.teams_db import get_team
 
     name = raw.get("name", raw.get("teamName", fallback_id))
-    found = find_team_by_name(name)
-    if found:
+
+    # Use the robust resolver instead of simple string matching
+    team_id = resolve_team_id(name)
+
+    if team_id != "unk":
+        team = get_team(team_id)
         return {
-            "id": found["id"],
-            "name": found["name"],
-            "short": found["short"],
-            "color": found["color"],
+            "id": team["id"],
+            "name": team["name"],
+            "short": team["short"],
+            "color": team["color"],
         }
+
+    # Fallback — unknown team
     short = name[:3].upper() if name else fallback_id.upper()
     return {"id": fallback_id, "name": name, "short": short, "color": "#666"}
 
@@ -340,6 +349,11 @@ def fetch_scorecard(match_id: str) -> list[dict]:
     data = _api_get("match_scorecard", {"id": match_id})
     if data and data.get("data"):
         d = data["data"]
+
+        # Try to extract team names for each innings
+        team_list = d.get("teams", [])
+        match_info = d.get("matchInfo", {})
+
         innings_list = []
         for idx, sc in enumerate(d.get("scorecard", d.get("score", []))):
             batters = []
@@ -364,9 +378,17 @@ def fetch_scorecard(match_id: str) -> list[dict]:
             inning_wkts = sc.get("w", sc.get("wickets", 0))
             inning_overs = sc.get("o", sc.get("overs", 0.0))
 
+            # Try to resolve batting/bowling team from scorecard data
+            batting_team_name = sc.get("inning", sc.get("batting", ""))
+            if isinstance(batting_team_name, dict):
+                batting_team_name = batting_team_name.get("name", "")
+
+            from core.squad_resolver import resolve_team_id
+            batting_team_id = resolve_team_id(str(batting_team_name)) if batting_team_name else ""
+
             innings_list.append({
                 "inning_number": idx + 1,
-                "batting_team": "",
+                "batting_team": batting_team_id,
                 "bowling_team": "",
                 "runs": inning_runs,
                 "wickets": inning_wkts,
@@ -409,7 +431,6 @@ def fetch_schedule() -> list[dict]:
                     "team_a": _norm_team({"name": m.get("teams", [""])[0] if m.get("teams") else ""}),
                     "team_b": _norm_team({"name": m.get("teams", ["", ""])[1] if m.get("teams") and len(m.get("teams", [])) > 1 else ""}),
                 })
-                matches.append(matches[-1])  # fixed: just append once
         # deduplicate
         seen = set()
         unique = []
